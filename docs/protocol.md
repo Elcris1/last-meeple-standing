@@ -9,7 +9,7 @@
  ┌──────────────┐  tag reads        ┌──────────────────┐   state / events   ┌───────────────┐
  │ Meeple ×4    │ ───────────────▶  │                  │ ─────────────────▶ │ Control base  │
  │ ESP-01+PN532 │ ◀───────────────  │  Rules controller│ ◀───────────────── │ ESP32 + LCD   │
- └──────────────┘  LED commands     │  (PC, authority) │   button presses   │ button/buzzer │
+ └──────────────┘  LED commands     │  (PC, authority) │   menu actions     │ button/buzzer │
                                     └────────┬─────────┘                    └───────────────┘
                                              │ state / events
                                              ▼
@@ -22,12 +22,14 @@
 Design principles:
 
 1. **The rules controller is the single source of truth.** Meeples and the base
-   never change game state; they only report *inputs* (a tag was read, the
-   button was pressed) and render *outputs* (LEDs, LCD, buzzer).
-2. **Inputs are raw, interpretation is central.** The base sends `short` /
-   `long` presses, not "attack" or "pass"; the meeple sends a tag UID, not a
-   cell. The controller decides what they mean based on the current state.
-   This keeps firmware simple and lets us change rules without reflashing.
+   never change game state, they only report *inputs* (a tag was read, the
+   player chose an action in the menu) and render *outputs* (LEDs, LCD, buzzer).
+2. **The controller decides what is allowed, the base only shows it.** The
+   controller publishes in `game/state` which options the active player has.
+   The base turns them into an on-screen menu, handles the navigation locally
+   and sends only the chosen action. The controller validates every action
+   again before applying it. The meeple sends a tag UID, not a cell, and the
+   controller decides what it means.
 3. **Event-driven, asynchronous by default.** Nobody polls. Every component
    reacts to messages.
 4. **Small payloads for small devices.** The ESP-01 has ~40 KB of free heap,
@@ -37,33 +39,62 @@ Hardware per component (from the LAB kit 26/27):
 
 | Component | Hardware | Notes that affect the protocol |
 |---|---|---|
-| Meeple ×4 | ESP-01, PN532 RFID reader (I2C), 1 red LED, powerbank | I2C uses GPIO0/GPIO2, so the LED must go on GPIO1/GPIO3 (TX/RX). That leaves no serial debug in the game, so meeples log over MQTT. A single-colour LED can only show blink patterns. |
-| Control base ×1 | ESP32 (FreeRTOS), 128×64 graphic serial LCD (5 V, TX/RX through the logic level converter), passive buzzer, push button, LED | Renders everything from `game/state`; sounds come from `game/event` with `tone()`. |
-| Board | 4×4 grid, one RFID tag per cell | Tag UIDs are mapped to cells in a config file (M4). |
+| Meeple ×4 | ESP-01, PN532 RFID reader (I2C), 1 red LED, powerbank | A single-colour LED can only show blink patterns. |
+| Control base ×1 | ESP32 (FreeRTOS), 128×64 graphic serial LCD (5 V), passive buzzer, push button, LED | Renders everything from `game/state`. Sounds come from `game/event` with `tone()`. |
+| Board | 4×4 grid, one RFID tag per cell | Tag UIDs are mapped to cells in a config file. |
 | Network | ad hoc LAN created by the group, broker on the PC | Fixed broker IP. |
 
 ## 2. MQTT topic tree
 
-Root prefix: `lms/` (Last Meeple Standing). `{id}` is the meeple id `m1`…`m4`
-(fixed in each meeple's firmware config).
+Root prefix: `lms/` (Last Meeple Standing). `{id}` is the meeple id `m1`…`m4`. The `id` is assigned the first time the ESP01 Chip ID is read and is not changed.
 
-| Topic | Publisher → Subscriber | QoS | Retained | Purpose |
-|---|---|---|---|---|
-| `lms/meeple/{id}/tag` | meeple → controller | 1 | no | RFID tag placed / removed |
-| `lms/meeple/{id}/led` | controller → meeple | 1 | **yes** | LED pattern to show |
-| `lms/meeple/{id}/status` | meeple → controller | 1 | **yes** | online / offline (LWT) |
-| `lms/meeple/{id}/log` | meeple → frontend | 0 | no | debug text (no serial port free on the ESP-01) |
-| `lms/base/button` | base → controller | 1 | no | button press |
-| `lms/base/status` | base → controller | 1 | **yes** | online / offline (LWT) |
-| `lms/game/state` | controller → base, frontend | 1 | **yes** | full game snapshot |
-| `lms/game/event` | controller → base, frontend | 1 | no | things that just happened (sounds, messages) |
-| `lms/game/cmd` | frontend / CLI → controller | 1 | no | admin: start, reset, pause |
-| `lms/controller/status` | controller → all | 1 | **yes** | online / offline (LWT) |
+| Topic | Publisher → Subscriber | Retained | Purpose |
+|---|---|---|---|
+| `lms/meeple/{id}/tag` | meeple → controller | no | RFID tag placed / removed |
+| `lms/meeple/{id}/led` | controller → meeple | **yes** | LED pattern to show |
+| `lms/meeple/{id}/status` | meeple → controller | **yes** | online / offline (LWT) |
+| `lms/meeple/{id}/log` | meeple → frontend | no | debug text (no serial port free on the ESP-01) |
+| `lms/base/action` | base → controller | no | action chosen in the menu |
+| `lms/base/status` | base → controller |  **yes** | online / offline (LWT) |
+| `lms/game/state` | controller → base, frontend | **yes** | full game snapshot |
+| `lms/game/event` | controller → base, frontend | no | things that just happened (sounds, messages) |
+| `lms/game/cmd` | frontend / CLI → controller | no | admin: start, reset, pause |
+| `lms/controller/status` | controller → all | **yes** | online / offline (LWT) |
 
 Why retained where it is: a device that (re)connects immediately receives the
 current state, its current LED pattern and who is online, without having to
 ask for it. Events are **not** retained: replaying an old "hit" sound on
 reconnect would be wrong.
+
+### 2.1 QoS 2 and MQTT client library
+
+All game topics use **QoS 2** (exactly once). In a turn-based game every
+input matters: a lost tag read leaves the board out of sync, and a duplicated
+action would pass the turn of the next player. QoS 2 makes the broker
+guarantee that each message is delivered exactly once on every hop. Only `log`
+uses QoS 0: losing a debug line does not matter and it saves traffic on the
+ESP-01.
+
+**Library choice.** The usual Arduino MQTT library, PubSubClient, can only
+*publish* with QoS 0 (it can subscribe with QoS 1 at most), so it cannot
+provide QoS 2. Because we want QoS 2 we use:
+
+| Component | Library | QoS 2 publish and subscribe |
+|---|---|---|
+| Meeple (ESP-01 / ESP8266) | AsyncMqttClient | yes |
+| Control base (ESP32) | AsyncMqttClient | yes |
+| Controller (PC) | paho-mqtt | yes |
+
+Using the same library on both firmwares also lets the meeple and the base
+share their MQTT connection code.
+
+Rules to get real QoS 2 end to end:
+- **Subscribe with QoS 2 too.** The broker delivers each message with the
+  lower of the publish QoS and the subscribe QoS.
+- **Persistent sessions.** Every client connects with `cleanSession = false`
+  and a fixed client id (meeples: `lms-m1`…`lms-m4`, `lms-base`,
+  `lms-controller`), so the broker keeps queued QoS 2 messages while a device
+  is briefly offline.
 
 Subscriptions per component:
 
@@ -71,7 +102,7 @@ Subscriptions per component:
 |---|---|
 | Meeple `m2` | `lms/meeple/m2/led`, `lms/controller/status` |
 | Control base | `lms/game/state`, `lms/game/event`, `lms/controller/status` |
-| Controller | `lms/meeple/+/tag`, `lms/meeple/+/status`, `lms/base/button`, `lms/base/status`, `lms/game/cmd` |
+| Controller | `lms/meeple/+/tag`, `lms/meeple/+/status`, `lms/base/action`, `lms/base/status`, `lms/game/cmd` |
 | Frontend | `lms/#` (read-only, debugging and visualization, includes meeple logs) |
 
 ## 3. Message anatomy
@@ -98,12 +129,23 @@ The controller translates `uid` to a cell with the board map
 { "04A1B2C3": "A1", "04D4E5F6": "A2", "...": "..." }
 ```
 
-**`lms/base/button`**:
+**`lms/base/action`** – sent once, when an option is selected in the menu
+(§4.3):
 ```json
-{ "seq": 5, "press": "short", "seen_rev": 42, "ts": 120400 }
+{ "seq": 5, "action": "attack", "target": "m1", "seen_rev": 42, "ts": 120400 }
+{ "seq": 6, "action": "pass", "seen_rev": 44, "ts": 131020 }
 ```
-`press` is `short` (< 600 ms) or `long` (≥ 600 ms). `seen_rev` is the state
-revision the LCD was showing when the button was pressed (see §5).
+| `action` | Extra fields | Meaning |
+|---|---|---|
+| `move` | — | arm the movement: the controller starts accepting a tag read from the active meeple |
+| `cancel_move` | — | "Back" while moving, before placing the meeple |
+| `attack` | `target` | attack that adjacent rival |
+| `pass` | — | end the turn |
+| `start` | — | lobby: start the game |
+| `new_game` | — | game over: back to the lobby |
+
+`seen_rev` is the state revision the menu was built from (see §5). Navigation
+between options never leaves the base.
 
 **`lms/meeple/{id}/status`**, **`lms/base/status`** (also used as LWT):
 ```json
@@ -142,7 +184,7 @@ blinking = game paused or controller offline; off = no Wi-Fi.
   "phase": "playing",
   "round": 4,
   "order": ["m3", "m1", "m2", "m4"],
-  "turn": { "player": "m2", "step": "moved", "targets": ["m1"], "target": null },
+  "turn": { "player": "m2", "step": "moved", "options": ["attack", "pass"], "targets": ["m1"] },
   "players": {
     "m1": { "cell": "B2", "hp": 7,  "weapon": "knife", "alive": true,  "online": true, "placed": true },
     "m2": { "cell": "B3", "hp": 10, "weapon": "fists", "alive": true,  "online": true, "placed": true },
@@ -157,8 +199,11 @@ blinking = game paused or controller offline; off = no Wi-Fi.
 }
 ```
 - `phase`: `lobby` → `playing` ⇄ `paused` → `finished`.
-- `turn.step`: `start` (no action yet) → `moved` (can attack or pass) →
-  `targeting` (choosing a target with the button) → next player.
+- `turn.step`: `start` (no action yet) → `moving` ("Move" selected, waiting
+  for the meeple to be placed) → `moved` (can attack or pass) → next player.
+- `turn.options`: actions the active player can choose now; the base builds
+  the menu from this list. `attack` only appears if `targets` (adjacent living
+  rivals) is not empty. `move` only appears in `start`.
 - `placed: false`: the physical meeple is not on the cell the controller
   expects (lifted, or left on an invalid cell).
 - `fire`: rounds of fire left per cell. `lightning`: cells that will be struck
@@ -173,7 +218,8 @@ blinking = game paused or controller offline; off = no Wi-Fi.
 | `game_start` | `order` | start jingle |
 | `turn_start` | `player`, `round` | short beep |
 | `move_ok` | `player`, `from`, `to` | — |
-| `move_invalid` | `player`, `reason` (`diagonal`, `not_adjacent`, `occupied`, `second_move`, `not_your_turn`, `unknown_tag`) | error sound |
+| `move_invalid` | `player`, `reason` (`diagonal`, `not_adjacent`, `occupied`, `second_move`, `not_your_turn`, `move_not_selected`, `unknown_tag`) | error sound |
+| `action_rejected` | `action`, `reason` (`stale`, `not_allowed`, `invalid_target`) | error sound, menu rebuilt from the current state |
 | `pickup` | `player`, `item`, `cell` | pickup sound |
 | `attack_hit` | `by`, `on`, `weapon`, `dmg`, `hp` | hit sound |
 | `attack_miss` | `by`, `on`, `weapon`, `roll` | miss sound |
@@ -212,7 +258,7 @@ sequenceDiagram
     M->>B: meeple/m1/tag {uid: A1 tag}
     B-->>C: tag → m1 placed on A1
     C->>B: game/state (m1 ready)
-    S->>B: base/button {press:"long"}
+    S->>B: base/action {action:"start"} ("Start game" selected in the menu)
     B-->>C: start (≥ 2 meeples placed on corners)
     C->>B: game/event game_start + game/state {phase:"playing"}
 ```
@@ -222,9 +268,9 @@ because retained messages give late joiners the current picture.
 
 ### 4.2 Synchronous vs asynchronous interactions
 
-MQTT is asynchronous publish/subscribe; there is no request/response built in.
+MQTT is asynchronous publish/subscribe so there is no request/response built in.
 
-- **Asynchronous (fire-and-forget):** button presses, tag reads, status
+- **Asynchronous (fire-and-forget):** menu actions, tag reads, status
   changes, events, state broadcasts. The sender never waits.
 - **Request → reaction (logically synchronous):** a move or an attack is a
   *request* that only becomes real when the controller answers. The meeple
@@ -236,18 +282,60 @@ MQTT is asynchronous publish/subscribe; there is no request/response built in.
   processed one at a time from a single queue, so two inputs can never be
   applied concurrently.
 
-### 4.3 Button semantics (shared base, single button)
+### 4.3 Menu on the control base (single button)
 
-The meaning of the button depends on `turn.step` of the active player:
+The base shows a menu on the LCD and the single button always works the same
+way:
 
-| Step | `short` press | `long` press |
-|---|---|---|
-| lobby | — | start game |
-| `start` / `moved` | **pass** (end turn) | enter **targeting** (only if `targets` is not empty) |
-| `targeting` | cycle to the next adjacent rival | **confirm attack** on the selected rival |
-| `finished` | — | back to lobby |
+- **Short press** (< 600 ms): move the cursor to the next option. The menu is
+  circular: after the last option it goes back to the first one.
+- **Long press** (≥ 600 ms): select the option under the cursor. The buzzer
+  beeps when 600 ms are reached, so the player knows they can release.
+- Every submenu ends with **Back**, which returns to the previous menu.
 
-Targeting is cancelled after 10 s without presses (back to the previous step).
+The menu lives in the base: moving the cursor sends nothing over MQTT, so the
+cursor reacts instantly. Only the final selection is sent to
+`lms/base/action`. The options come from `turn.options` and `turn.targets` in
+`game/state`, so the base never shows an option the rules do not allow.
+
+Menus:
+
+```
+LOBBY                 TURN M2 (R4)          MOVE                  ATTACK
+> Start game          > Move                Place your meeple     > M1  B2  7hp
+                        Attack              on a free cell        M4  C3  4hp
+                        Pass                > Back                Back
+
+AFTER MOVING          GAME OVER
+> Attack              M2 wins!
+  Pass                > New game
+```
+
+| Menu | Option selected | Sent | Result |
+|---|---|---|---|
+| Lobby | Start game | `start` | game starts (≥ 2 meeples on corners) |
+| Turn | Move | `move` | step `moving`; the controller accepts one tag read from the active meeple |
+| Move | Back | `cancel_move` | back to step `start` (only before placing the meeple) |
+| Turn / After moving | Attack | — | opens the Attack submenu (local) |
+| Attack | a rival | `attack` + `target` | attack resolved, turn ends |
+| Attack | Back | — | back to the previous menu (local) |
+| Turn / After moving | Pass | `pass` | turn ends |
+| Game over | New game | `new_game` | back to the lobby |
+
+**Move must be selected first.** A tag read from the active meeple is only
+accepted as a move in step `moving`. If the meeple is moved without selecting
+Move (for example, someone knocks it by accident), the controller answers
+`move_invalid {reason:"move_not_selected"}` and the meeple must go back to its
+cell, as with any invalid move.
+
+Menu rules on the base:
+- When a new `game/state` arrives (higher `rev`), the menu is rebuilt from it
+  and the cursor goes back to the first option. For example, if a rival dies
+  while the Attack submenu is open, it disappears from the list.
+- After sending an action, the menu is locked (shows "...") until a state with
+  a higher `rev` or an `action_rejected` event arrives. This prevents sending
+  the same action twice. If nothing arrives in 3 s, the menu is unlocked again.
+- While the game is `paused`, the menu is hidden and the LCD shows the reason.
 
 ### 4.4 A full turn: move + attack
 
@@ -257,14 +345,17 @@ sequenceDiagram
     participant C as Controller
     participant S as Base
     C->>S: event turn_start {player:m2}
+    C->>S: state {step:"start", options:["move","attack","pass"]}
     C->>M: led {pattern:"active"}
+    Note over S: menu: Move selected (long press)
+    S->>C: action {action:"move"}
+    C->>S: state {step:"moving"}
     M->>C: tag {uid: B3}
     Note over C: valid: orthogonal, free, first move
     C->>S: event move_ok + event pickup (knife)
-    C->>S: state {step:"moved", targets:["m1"]}
-    S->>C: button long
-    C->>S: state {step:"targeting", target:"m1"}
-    S->>C: button long
+    C->>S: state {step:"moved", options:["attack","pass"], targets:["m1"]}
+    Note over S: menu: Attack → M1 (short/long presses, local)
+    S->>C: action {action:"attack", target:"m1"}
     Note over C: roll 1..100 ≤ 85 → hit
     C->>S: event attack_hit {dmg:2}
     C->>M: led {pattern:"idle"}
@@ -278,6 +369,7 @@ sequenceDiagram
     participant M as Meeple m2
     participant C as Controller
     participant S as Base
+    Note over C: step "moving" (Move already selected)
     M->>C: tag {uid: C4} (diagonal)
     C->>S: event move_invalid {reason:"diagonal"} (error sound)
     C->>M: led {pattern:"error"}
@@ -297,13 +389,18 @@ sequenceDiagram
    latest state from the broker instantly. No "resync" request is needed.
 3. **Revisions.** Clients ignore any state or event with `rev` lower than the
    last one they applied (protection against reordering).
-4. **Stale inputs.** The base sends `seen_rev`. If the turn changed since
-   then (`turn.player` differs), the controller ignores the press. This avoids
-   a quick double press passing the turn of the *next* player.
-5. **Duplicates.** QoS 1 guarantees at-least-once delivery, so a message may
-   arrive twice. The controller remembers the last `seq` per device and drops
-   any message with `seq <= last`. A device that reboots restarts from
-   `seq = 0`; its `status {online:true}` message resets the counter.
+4. **Stale actions.** The base sends `seen_rev`, the revision its menu was
+   built from. If the turn changed since then (`turn.player` differs) or the
+   action is no longer in `turn.options`, the controller rejects it with
+   `action_rejected`. This avoids an action meant for one player being applied
+   to the *next* player.
+5. **Duplicates.** All game topics use QoS 2 (exactly once), so MQTT itself
+   does not deliver a message twice. QoS 2 only covers each hop inside one
+   MQTT session, though: if a device reboots or its firmware re-sends a message
+   after reconnecting, the broker sees a new message. The controller therefore
+   still remembers the last `seq` per device and drops any message with
+   `seq <= last`. A device that reboots restarts from `seq = 0`; its
+   `status {online:true}` message resets the counter.
 6. **Physical vs logical state.** The physical position of a meeple can differ
    from the logical one (invalid move, lifted piece). The controller keeps the
    logical cell and a `placed` flag; the game does not advance while the active
@@ -318,15 +415,18 @@ sequenceDiagram
 |---|---|---|
 | Device loses Wi-Fi / reboots | LWT publishes `{online:false}`; keepalive 10 s | Game goes to `paused` if the active meeple or the base is offline; resumes automatically when it is back. Retained state restores the device. |
 | Controller crashes | `lms/controller/status` LWT | Devices show "waiting for controller"; controller reloads `state.json` and republishes. |
-| Duplicated MQTT messages (QoS 1) | `seq` per device | Drop `seq <= last_seq`. |
-| Lost messages | — | QoS 1 + full snapshots (next state fixes any missed one). |
+| Duplicated messages | QoS 2 handshake; `seq` per device | QoS 2 removes protocol duplicates; `seq <= last_seq` drops re-sends after a reboot or reconnect. |
+| Lost messages | — | QoS 2 + persistent sessions (§2.1), so the broker queues messages while a device is briefly offline; full snapshots fix anything still missed. |
 | RFID bouncing / partial reads while sliding the meeple | — | Meeple debounce: same UID read stable for 300 ms before publishing. |
 | Unknown tag (not in board map) | lookup fails | `move_invalid {reason:"unknown_tag"}`, ignored. |
 | Meeple moved out of turn | `turn.player != id` | `move_invalid {reason:"not_your_turn"}`, `placed:false`, error LED. |
-| Double or stale button press | `seen_rev`, `seq` | Ignored if the turn changed. |
+| Meeple knocked or moved by accident during its own turn | tag read outside step `moving` | Not counted as a move: `move_invalid {reason:"move_not_selected"}`, the meeple goes back to its cell. |
+| Double or stale action | `seen_rev`, `seq`, menu lock | Menu locked until the answer arrives; the controller rejects actions from an old turn or not in `turn.options`. |
+| Base menu shows options that are no longer valid | new `rev` | Menu rebuilt on every new state; the controller validates every action again. |
 | Malformed JSON / missing fields | schema validation in the controller | Message discarded and logged; never crashes the controller. |
 | ESP-01 memory limits | — | Meeple only subscribes to its own LED topic; payloads < 100 bytes. |
-| `game/state` (~600 B) bigger than the MQTT client buffer | message silently dropped by the base | PubSubClient defaults to 256 B: call `setBufferSize(1024)` on the ESP32. |
+| `game/state` (~600 B) arrives in several TCP chunks | partial payload in the callback | AsyncMqttClient delivers big messages in fragments (`index`, `total`): the base joins them in a buffer before parsing the JSON. |
+| QoS 2 in-flight messages use RAM on the ESP-01 | — | Meeple payloads are < 100 B and it only has one subscription, so few messages are pending at a time. |
 | ESP-01 / ESP32 need time to start (kit warning) and boot in any order | — | Retry Wi-Fi and MQTT with backoff; retained messages make boot order irrelevant (§4.1). |
 | No serial debug on the meeple (TX/RX pin used for the LED) | — | Debug text on `lms/meeple/{id}/log`. |
 | Powerbank turns off under low current draw | meeple LWT fires | Test the kit powerbanks with the meeple running; the game pauses (row 1) if it happens. |
@@ -337,10 +437,12 @@ sequenceDiagram
 
 These are not in the original rules document and need group approval:
 
-- Button: `short` = pass / next target; `long` = attack mode / confirm attack /
-  start game (§4.3).
-- Lobby: the game starts with a long press once at least 2 meeples are placed
-  on corner cells. Players that are not online at start do not play.
+- The base shows a menu: short press = next option, long press = select,
+  every submenu has Back (§4.3).
+- To move, the player must first select Move in the menu and then place the
+  meeple. A move without selecting Move is invalid.
+- Lobby: the game starts by selecting "Start game" once at least 2 meeples are
+  placed on corner cells. Players that are not online at start do not play.
 - A player whose meeple is not on its logical cell blocks their own turn until
   it is put back.
 - The game pauses if the active meeple or the base goes offline.
