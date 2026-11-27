@@ -1,0 +1,16 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: lms-mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883" # Standard MQTT (ESP-01, ESP-32, Python game-controller, simulator)
+      - "9001:9001" # MQTT over WebSockets (Browser frontend)
+    volumes:
+      - ./mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+
+volumes:
+  mosquitto_data:
+  mosquitto_log:

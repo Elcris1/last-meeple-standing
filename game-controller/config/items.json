@@ -1,0 +1,59 @@
+{
+  "default_weapon": "fists",
+  "items": [
+    {
+      "id": "fists",
+      "type": "weapon",
+      "damage": 1,
+      "hit_chance": 90,
+      "rarity": "default",
+      "spawn_weight": 0
+    },
+    {
+      "id": "small_heal",
+      "type": "healing",
+      "heal_amount": 2,
+      "rarity": "common",
+      "spawn_weight": 30
+    },
+    {
+      "id": "knife",
+      "type": "weapon",
+      "damage": 2,
+      "hit_chance": 85,
+      "rarity": "common",
+      "spawn_weight": 25
+    },
+    {
+      "id": "large_heal",
+      "type": "healing",
+      "heal_amount": 4,
+      "rarity": "uncommon",
+      "spawn_weight": 15
+    },
+    {
+      "id": "sword",
+      "type": "weapon",
+      "damage": 3,
+      "hit_chance": 75,
+      "rarity": "uncommon",
+      "spawn_weight": 15
+    },
+    {
+      "id": "axe",
+      "type": "weapon",
+      "damage": 4,
+      "hit_chance": 65,
+      "rarity": "rare",
+      "spawn_weight": 10
+    },
+    {
+      "id": "spear",
+      "type": "weapon",
+      "damage": 5,
+      "hit_chance": 55,
+      "rarity": "legendary",
+      "spawn_weight": 5
+    }
+  ]
+}
